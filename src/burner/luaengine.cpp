@@ -284,6 +284,295 @@ static int fba_speedmode(lua_State *L) {
 	return 0;
 }
 
+// number fba.setspeed(number scale)
+//   Sets native emulation speed multiplier (0.10 to 2.00) when not in live netplay.
+static int fba_setspeed(lua_State *L) {
+	double scale = luaL_checknumber(L, 1);
+#ifdef WIN32
+	EmulatorSetSpeedScale(scale);
+	lua_pushnumber(L, EmulatorGetSpeedScale());
+#else
+	lua_pushnumber(L, 1.0);
+#endif
+	return 1;
+}
+
+// number fba.getspeed()
+//   Returns current native emulation speed multiplier.
+static int fba_getspeed(lua_State *L) {
+#ifdef WIN32
+	lua_pushnumber(L, EmulatorGetSpeedScale());
+#else
+	lua_pushnumber(L, 1.0);
+#endif
+	return 1;
+}
+
+// ============================================================================
+// Direct C++ XBuf RGB24 Headless Frame Capture (file or invisible ffmpeg pipe)
+// ============================================================================
+static FILE* g_cap_file = NULL;
+static UINT8* g_cap_rgb_buf = NULL;
+static size_t g_cap_rgb_cap = 0;
+static int g_cap_w = 0;
+static int g_cap_h = 0;
+#ifdef WIN32
+static HANDLE g_cap_pipe = INVALID_HANDLE_VALUE;
+static HANDLE g_cap_proc = NULL;
+#endif
+
+int FBA_LuaCaptureActive() {
+#ifdef WIN32
+	if (g_cap_pipe != INVALID_HANDLE_VALUE) return 1;
+#endif
+	return (g_cap_file != NULL) ? 1 : 0;
+}
+
+void FBA_LuaCaptureClose() {
+	if (g_cap_file) {
+		fflush(g_cap_file);
+		fclose(g_cap_file);
+		g_cap_file = NULL;
+	}
+#ifdef WIN32
+	if (g_cap_pipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(g_cap_pipe);
+		g_cap_pipe = INVALID_HANDLE_VALUE;
+	}
+	if (g_cap_proc != NULL) {
+		WaitForSingleObject(g_cap_proc, 20000);
+		CloseHandle(g_cap_proc);
+		g_cap_proc = NULL;
+	}
+#endif
+	g_cap_w = 0;
+	g_cap_h = 0;
+}
+
+static bool EnsureCaptureBuffer(int w, int h) {
+	size_t need = (size_t)w * (size_t)h * 3;
+	if (need == 0) return false;
+	if (g_cap_rgb_cap < need) {
+		UINT8* p = (UINT8*)realloc(g_cap_rgb_buf, need);
+		if (!p) return false;
+		g_cap_rgb_buf = p;
+		g_cap_rgb_cap = need;
+	}
+	return true;
+}
+
+// boolean, w, h = emu.capture_open(path)
+static int fba_capture_open(lua_State *L) {
+	const char* path = luaL_checkstring(L, 1);
+	FBA_LuaCaptureClose();
+
+	if (nVidImageWidth <= 0 || nVidImageHeight <= 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Video buffer not initialized");
+		return 2;
+	}
+	FILE* f = fopen(path, "wb");
+	if (!f) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Failed to open capture output path");
+		return 2;
+	}
+	setvbuf(f, NULL, _IOFBF, 256 * 1024);
+	g_cap_file = f;
+	g_cap_w = nVidImageWidth;
+	g_cap_h = nVidImageHeight;
+	EnsureCaptureBuffer(g_cap_w, g_cap_h);
+	lua_pushboolean(L, 1);
+	lua_pushinteger(L, g_cap_w);
+	lua_pushinteger(L, g_cap_h);
+	return 3;
+}
+
+// boolean, w, h = emu.capture_pipe(cmdline)
+static int fba_capture_pipe(lua_State *L) {
+	const char* cmdline = luaL_checkstring(L, 1);
+	FBA_LuaCaptureClose();
+
+	if (nVidImageWidth <= 0 || nVidImageHeight <= 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Video buffer not initialized");
+		return 2;
+	}
+#ifdef WIN32
+	SECURITY_ATTRIBUTES sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.nLength = sizeof(sa);
+	sa.bInheritHandle = TRUE;
+
+	HANDLE hRead = INVALID_HANDLE_VALUE;
+	HANDLE hWrite = INVALID_HANDLE_VALUE;
+	if (!CreatePipe(&hRead, &hWrite, &sa, 1024 * 1024)) {
+		lua_pushnil(L);
+		lua_pushstring(L, "CreatePipe failed");
+		return 2;
+	}
+	// Ensure write end is NOT inherited by child process so EOF propagates cleanly on close
+	SetHandleInformation(hWrite, HANDLE_FLAG_INHERIT, 0);
+
+	HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+
+	STARTUPINFOA si;
+	memset(&si, 0, sizeof(si));
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+	si.hStdInput = hRead;
+	si.hStdOutput = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_OUTPUT_HANDLE);
+	si.hStdError = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE);
+
+	PROCESS_INFORMATION pi;
+	memset(&pi, 0, sizeof(pi));
+
+	std::string cmdCopy(cmdline);
+	BOOL ok = CreateProcessA(
+		NULL,
+		&cmdCopy[0],
+		NULL,
+		NULL,
+		TRUE,
+		CREATE_NO_WINDOW,
+		NULL,
+		NULL,
+		&si,
+		&pi
+	);
+
+	CloseHandle(hRead);
+	if (hNul != INVALID_HANDLE_VALUE) {
+		CloseHandle(hNul);
+	}
+
+	if (!ok) {
+		CloseHandle(hWrite);
+		lua_pushnil(L);
+		lua_pushstring(L, "CreateProcessA failed for capture pipe");
+		return 2;
+	}
+
+	CloseHandle(pi.hThread);
+	g_cap_pipe = hWrite;
+	g_cap_proc = pi.hProcess;
+	g_cap_w = nVidImageWidth;
+	g_cap_h = nVidImageHeight;
+	EnsureCaptureBuffer(g_cap_w, g_cap_h);
+
+	lua_pushboolean(L, 1);
+	lua_pushinteger(L, g_cap_w);
+	lua_pushinteger(L, g_cap_h);
+	return 3;
+#else
+	lua_pushnil(L);
+	lua_pushstring(L, "capture_pipe only supported on Win32");
+	return 2;
+#endif
+}
+
+// boolean = emu.capture_frame()
+static int fba_capture_frame(lua_State *L) {
+	if (!FBA_LuaCaptureActive() || !pVidImage || nVidImageWidth <= 0 || nVidImageHeight <= 0) {
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+
+#ifdef WIN32
+	if (!bVidImageFresh) {
+		VidRedraw();
+		bVidImageFresh = true;
+	}
+#endif
+
+	const int w = nVidImageWidth;
+	const int h = nVidImageHeight;
+	const int bpp = nVidImageBPP;
+	const int pitch = nVidImagePitch;
+	if (!EnsureCaptureBuffer(w, h)) {
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+
+	const UINT8* srcBase = pVidImage + nVidImageLeft * bpp;
+	UINT8* dst = g_cap_rgb_buf;
+
+	if (bpp == 4) {
+		for (int y = 0; y < h; y++) {
+			const UINT8* row = srcBase + y * pitch;
+			for (int x = 0; x < w; x++) {
+				dst[0] = row[2];
+				dst[1] = row[1];
+				dst[2] = row[0];
+				row += 4;
+				dst += 3;
+			}
+		}
+	} else if (bpp == 3) {
+		for (int y = 0; y < h; y++) {
+			const UINT8* row = srcBase + y * pitch;
+			for (int x = 0; x < w; x++) {
+				dst[0] = row[2];
+				dst[1] = row[1];
+				dst[2] = row[0];
+				row += 3;
+				dst += 3;
+			}
+		}
+	} else if (bpp == 2) {
+		for (int y = 0; y < h; y++) {
+			const UINT16* row = (const UINT16*)(srcBase + y * pitch);
+			for (int x = 0; x < w; x++) {
+				UINT16 px = row[x];
+				dst[0] = (UINT8)(((px >> 11) & 31) << 3);
+				dst[1] = (UINT8)(((px >> 5) & 63) << 2);
+				dst[2] = (UINT8)((px & 31) << 3);
+				dst += 3;
+			}
+		}
+	} else {
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+
+	const size_t totalBytes = (size_t)w * (size_t)h * 3;
+	bool wroteOk = false;
+#ifdef WIN32
+	if (g_cap_pipe != INVALID_HANDLE_VALUE) {
+		size_t offset = 0;
+		wroteOk = true;
+		while (offset < totalBytes) {
+			DWORD written = 0;
+			if (!WriteFile(g_cap_pipe, g_cap_rgb_buf + offset, (DWORD)(totalBytes - offset), &written, NULL) || written == 0) {
+				wroteOk = false;
+				break;
+			}
+			offset += (size_t)written;
+		}
+	} else
+#endif
+	if (g_cap_file) {
+		wroteOk = (fwrite(g_cap_rgb_buf, 1, totalBytes, g_cap_file) == totalBytes);
+	}
+
+	lua_pushboolean(L, wroteOk ? 1 : 0);
+	return 1;
+}
+
+// boolean = emu.capture_close()
+static int fba_capture_close(lua_State *L) {
+	FBA_LuaCaptureClose();
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// boolean = emu.capture_active()
+static int fba_capture_active(lua_State *L) {
+	lua_pushboolean(L, FBA_LuaCaptureActive() ? 1 : 0);
+	return 1;
+}
+
 
 // fba.frameadvance()
 //
@@ -356,14 +645,14 @@ static int fba_unpause(lua_State *L) {
 //
 //   Gets the screen width
 int fba_screenwidth(lua_State *L) {
-	lua_pushinteger(L, iScreenWidth);
+	lua_pushinteger(L, (nVidImageWidth > 0) ? nVidImageWidth : iScreenWidth);
 	return 1;
 }
 // int fba.screenheight()
 //
 //   Gets the screen height
 int fba_screenheight(lua_State *L) {
-	lua_pushinteger(L, iScreenHeight);
+	lua_pushinteger(L, (nVidImageHeight > 0) ? nVidImageHeight : iScreenHeight);
 	return 1;
 }
 
@@ -3829,6 +4118,13 @@ static const struct luaL_reg fbalib [] = {
 	{"parentname", fba_parentname},
 	{"sourcename", fba_sourcename},
 	{"speedmode", fba_speedmode},
+	{"setspeed", fba_setspeed},
+	{"getspeed", fba_getspeed},
+	{"capture_open", fba_capture_open},
+	{"capture_pipe", fba_capture_pipe},
+	{"capture_frame", fba_capture_frame},
+	{"capture_close", fba_capture_close},
+	{"capture_active", fba_capture_active},
 	{"frameadvance", fba_frameadvance},
 	{"isonline", fba_isonline},
 	{"isreplay", fba_isreplay},
@@ -4004,7 +4300,11 @@ void FBA_LuaFrameBoundary() {
 		
 		// Error?
 #ifdef WIN32
-		MessageBoxA( hScrnWnd, lua_tostring(thread,-1), "Lua run error", MB_OK | MB_ICONSTOP);
+		if (!bHeadlessMode) {
+			MessageBoxA( hScrnWnd, lua_tostring(thread,-1), "Lua run error", MB_OK | MB_ICONSTOP);
+		} else {
+			fprintf(stderr, "Lua run error: %s\n", lua_tostring(thread,-1));
+		}
 #else
 		fprintf(stderr, "Lua thread bombed out: %s\n", lua_tostring(thread,-1));
 #endif
@@ -4197,7 +4497,11 @@ void FBA_LuaStop() {
 
 	lua_close(LUA); // this invokes our garbage collectors for us
 	LUA = NULL;
+	FBA_LuaCaptureClose();
 	FBA_LuaOnStop();
+#ifdef WIN32
+	EmulatorSetSpeedScale(1.0);
+#endif
 }
 
 
@@ -4322,7 +4626,11 @@ void FBA_LuaGui(unsigned char *s, int width, int height, int bpp, int pitch) {
 		chdir(fbnCWD);
 		if (ret != 0) {
 #ifdef WIN32
-			MessageBoxA(hScrnWnd, lua_tostring(LUA, -1), "Lua Error in GUI function", MB_OK);
+			if (!bHeadlessMode) {
+				MessageBoxA(hScrnWnd, lua_tostring(LUA, -1), "Lua Error in GUI function", MB_OK);
+			} else {
+				fprintf(stderr, "Lua error in gui.register function: %s\n", lua_tostring(LUA, -1));
+			}
 #else
 			fprintf(stderr, "Lua error in gui.register function: %s\n", lua_tostring(LUA, -1));
 #endif

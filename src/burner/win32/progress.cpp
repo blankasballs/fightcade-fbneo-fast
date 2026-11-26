@@ -158,7 +158,7 @@ static unsigned __stdcall DoProgress(void*)
 
 int ProgressCreate()
 {
-	if (hProgressDlg || hProgressThread) {
+	if (bHeadlessMode || hProgressDlg || hProgressThread) {
 		return 1;
 	}
 

@@ -251,6 +251,8 @@ int RunMessageLoop();
 int RunInit();
 int RunReset();
 void ToggleLayer(unsigned char thisLayer);
+void EmulatorSetSpeedScale(double fScale);
+double EmulatorGetSpeedScale();
 
 // scrn.cpp
 extern HWND hScrnWnd;									// Handle to the screen window
@@ -442,6 +444,9 @@ int NetworkGetInputSize();
 int NetworkGetInput();
 
 // fbn_ggpo.cpp
+extern bool bMaxSpeedMode;
+extern bool bHeadlessMode;
+extern bool bVidImageFresh;
 void QuarkInit(TCHAR *connect);
 void QuarkEnd();
 void QuarkTogglePerfMon();

@@ -15,6 +15,7 @@ static int nAudioBufferWrite = 0;
 
 static int nXAudio2Fps = 0;					// Application fps * 100
 static float nXAudio2Vol = 1.0f;
+static float fXAudio2SpeedScale = 1.0f;
 
 struct StreamingVoiceContext : public IXAudio2VoiceCallback
 {
@@ -206,6 +207,16 @@ static int XAudio2Frame()
 }
 
 
+void XAudio2SetSpeed(double fScale)
+{
+	if (fScale < 0.10) fScale = 0.10;
+	if (fScale > 2.00) fScale = 2.00;
+	fXAudio2SpeedScale = (float)fScale;
+	if (pSourceVoice) {
+		pSourceVoice->SetFrequencyRatio(fXAudio2SpeedScale);
+	}
+}
+
 static int XAudio2Play()
 {
 	if (pSourceVoice == NULL) {
@@ -214,6 +225,7 @@ static int XAudio2Play()
 
 	XAudio2BlankSound();
 	pSourceVoice->SetVolume(nXAudio2Vol);
+	pSourceVoice->SetFrequencyRatio(fXAudio2SpeedScale);
 
 	if (FAILED(pSourceVoice->Start(0))) {
 		return 1;

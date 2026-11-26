@@ -889,17 +889,24 @@ int ProcessCmdLine()
 			while (szCommand[size] != _T('"') && (szCommand+size) < szEnd) {
 				size++;
 			}
-			wcsncpy(szOption, szCommand + 1, size - 2);
-			szOption[size - 2] = 0;
-			size++;
+			INT32 copyLen = size - 1;
+			if (copyLen < 0) copyLen = 0;
+			if (copyLen >= MAX_PATH) copyLen = MAX_PATH - 1;
+			wcsncpy(szOption, szCommand + 1, copyLen);
+			szOption[copyLen] = 0;
+			if ((szCommand + size) < szEnd && szCommand[size] == _T('"')) {
+				size++;
+			}
 		}
 		else {
 			// regular command
 			while (szCommand[size] != _T(' ') && (szCommand+size) < szEnd) {
 				size++;
 			}
-			wcsncpy(szOption, szCommand, size);
-			szOption[size] = 0;
+			INT32 copyLen = size;
+			if (copyLen >= MAX_PATH) copyLen = MAX_PATH - 1;
+			wcsncpy(szOption, szCommand, copyLen);
+			szOption[copyLen] = 0;
 		}
 		// skip whites
 		szCommand += size;
@@ -980,6 +987,16 @@ int ProcessCmdLine()
 				}
 				else if (_tcscmp(szOption, _T("-w")) == 0) {
 					bVidAutoSwitchFullDisable = true;
+				}
+				else if (_tcscmp(szOption, _T("-maxspeed")) == 0) {
+					bMaxSpeedMode = true;
+					bVidAutoSwitchFullDisable = true;
+				}
+				else if (_tcscmp(szOption, _T("-headless")) == 0) {
+					bHeadlessMode = true;
+					bMaxSpeedMode = true;
+					bVidAutoSwitchFullDisable = true;
+					bQuietLoading = true;
 				}
 				else if (_tcscmp(szOption, _T("-q")) == 0) {
 					QuarkRecordReplay();
@@ -1166,7 +1183,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nShowCmd
 
 	NeoCDZRateChangeback();                     // Change back temp CDZ rate before saving
 
-	ConfigAppSave();							// Save config for the application
+	if (!bHeadlessMode) {
+		ConfigAppSave();							// Save config for the application
+	}
 
 	AppExit();									// Exit the application
 

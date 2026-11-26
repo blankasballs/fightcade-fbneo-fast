@@ -697,6 +697,8 @@ void QuarkFinishReplay()
 		if (bReplayRecording) {
 			AviStop();
 			bMediaExit = true;
+		} else if (bMaxSpeedMode) {
+			bMediaExit = true;
 		}
 	}
 }

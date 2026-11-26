@@ -338,6 +338,13 @@ int FBAPopupDestroyText()
 
 int FBAPopupDisplay(int nFlags)
 {
+	if (bHeadlessMode) {
+		nPopupFlags = nFlags;
+		FBAPopupLog();
+		FBAPopupDestroyText();
+		return 1;
+	}
+
 	HMODULE hRiched = NULL;
 
 #if defined (_UNICODE)

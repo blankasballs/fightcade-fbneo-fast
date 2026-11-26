@@ -61,7 +61,7 @@ static unsigned __stdcall DoSplash(void*)
 
 int SplashCreate()
 {
-	if (hSplashDlg || !nSplashTime || hSplashThread) {
+	if (bHeadlessMode || hSplashDlg || !nSplashTime || hSplashThread) {
 		return 1;
 	}
 

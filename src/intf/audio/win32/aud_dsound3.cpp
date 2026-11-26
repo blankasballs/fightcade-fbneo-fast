@@ -22,6 +22,7 @@ static int nAudBufferWrite = 0;
 
 static int nDSoundFps;								// Application fps * 100
 static long nDSoundVol = 0;
+static double fDxSpeedScale = 1.0;
 
 static int DxSoundBufferDiff(int write, int read, int len)
 {
@@ -109,7 +110,7 @@ static int DxSoundInit()
 	// Make the loop sound buffer
 	memset(&dsbd, 0, sizeof(dsbd));
 	dsbd.dwSize = sizeof(dsbd);
-	dsbd.dwFlags = DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS | DSBCAPS_CTRLVOLUME;
+	dsbd.dwFlags = DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY;
 	dsbd.dwBufferBytes = nAudBufferLen;
 	dsbd.lpwfxFormat = &wfx;								// Same format as the primary buffer
 	if (FAILED(pDS->CreateSoundBuffer(&dsbd, &pdsbLoop, NULL))) {
@@ -167,7 +168,11 @@ static int DxSoundCheck()
 		void *pData1 = NULL, *pData2 = NULL;
 		DWORD nLen1 = 0, nLen2 = 0;
 		if (SUCCEEDED(pdsbLoop->Lock(nAudBufferWrite * nAudAllocSegLen, nAudAllocSegLen, &pData1, &nLen1, &pData2, &nLen2, 0))) {
-			memcpy(pData1, nAudNextSound, nLen1);
+			if (fDxSpeedScale < 0.999 || fDxSpeedScale > 1.001) {
+				memset(pData1, 0, nLen1);
+			} else {
+				memcpy(pData1, nAudNextSound, nLen1);
+			}
 			pdsbLoop->Unlock(pData1, nLen1, pData2, nLen2);
 			nAudBufferWrite = (nAudBufferWrite + 1) % nAudBufferCount;
 		}
@@ -205,9 +210,24 @@ static int DxSoundFrame()
 	return 0;
 }
 
+void DxSoundSetSpeed(double fScale)
+{
+	if (fScale < 0.10) fScale = 0.10;
+	if (fScale > 2.00) fScale = 2.00;
+	fDxSpeedScale = fScale;
+	if (!pdsbLoop || nAudSampleRate[0] <= 0) {
+		return;
+	}
+	DWORD freq = (DWORD)(nAudSampleRate[0] * fScale + 0.5);
+	if (freq < DSBFREQUENCY_MIN) freq = DSBFREQUENCY_MIN;
+	if (freq > DSBFREQUENCY_MAX) freq = DSBFREQUENCY_MAX;
+	pdsbLoop->SetFrequency(freq);
+}
+
 static int DxSoundPlay()
 {
 	pdsbLoop->SetVolume(nDSoundVol);
+	DxSoundSetSpeed(fDxSpeedScale);
 	if (FAILED(pdsbLoop->Play(0, 0, DSBPLAY_LOOPING))) {
 		return 1;
 	}

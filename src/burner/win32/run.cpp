@@ -33,6 +33,10 @@ static int nRunQuark = 1;
 int bRestartVideo = 0;
 int bDrvExit = 0;
 int bMediaExit = 0;
+bool bMaxSpeedMode = false;
+bool bHeadlessMode = false;
+bool bVidImageFresh = false;
+static double fAppSpeedScale = 1.0;
 
 // For System Macros (below)
 static int prevPause = 0, prevFFWD = 0, prevFrame = 0, prevSState = 0, prevLState = 0, prevUState = 0;
@@ -41,6 +45,27 @@ UINT32 prevPause_debounce = 0;
 void EmulatorAppDoFast(bool dofast) {
 	bAppDoFast = dofast;
 	bAppDoFastToggled = 0;
+}
+
+void EmulatorSetSpeedScale(double fScale) {
+	if (kNetGame && !kNetSpectator) {
+		fAppSpeedScale = 1.0;
+		return;
+	}
+	if (fScale < 0.10) fScale = 0.10;
+	if (fScale > 2.00) fScale = 2.00;
+	if (fAppSpeedScale != fScale) {
+		fAppSpeedScale = fScale;
+		nFrameLast = timeGetTime();
+		AudSoundSetSpeed(fAppSpeedScale);
+	}
+}
+
+double EmulatorGetSpeedScale() {
+	if (kNetGame && !kNetSpectator) {
+		return 1.0;
+	}
+	return fAppSpeedScale;
 }
 
 struct lua_hotkey_handler {
@@ -316,19 +341,24 @@ int RunFrame(int bDraw, int bPause, int bInput)
 				// Last frame is video only
 				pBurnSoundOut = NULL;
 				VidFrame();
+				bVidImageFresh = true;
 				// Restore state
 				RunaheadLoadState();
 			} else {
 				// Render video and audio
-				pBurnSoundOut = nAudNextSound;
+				pBurnSoundOut = bMaxSpeedMode ? NULL : nAudNextSound;
 				VidFrame();
+				bVidImageFresh = true;
 			}
 			// add audio from last frame
-			AudSoundFrame();
+			if (!bMaxSpeedMode) {
+				AudSoundFrame();
+			}
 		} else {
 			pBurnDraw = NULL;
-			pBurnSoundOut = nAudNextSound;
+			pBurnSoundOut = bMaxSpeedMode ? NULL : nAudNextSound;
 			BurnDrvFrame();
+			bVidImageFresh = false;
 		}
 
 		if (kNetGame) {
@@ -356,6 +386,73 @@ int RunFrame(int bDraw, int bPause, int bInput)
 
 int RunIdle()
 {
+	if (bMaxSpeedMode && !bRunPause && (!kNetGame || kNetSpectator)) {
+		const bool bDirectCapture = (FBA_LuaCaptureActive() != 0);
+		if (bAppDoFast && !bDirectCapture) {
+			// Unthrottled headless turbo: run up to 64 non-drawn frames per Win32 pump
+			for (int i = 0; i < 64; i++) {
+				if (kNetGame) {
+					QuarkRunIdle(0);
+				}
+				if (!bDrvOkay) {
+					if (kNetGame) QuarkRunIdle(1);
+					else Sleep(1);
+					break;
+				}
+				if (RunFrame(0, 0, 0) != 0) {
+					// Waiting on network replay packets
+					if (kNetGame) QuarkRunIdle(1);
+					break;
+				}
+				if (!bAppDoFast || FBA_LuaCaptureActive() || bMediaExit || (!kNetGame && nReplayStatus == 0)) {
+					break;
+				}
+			}
+		} else if (bDirectCapture) {
+			// Unthrottled direct C++ XBuf RGB24 capture: render software pVidImage, skip D3D Present/VidPaint!
+			for (int i = 0; i < 16; i++) {
+				if (kNetGame) {
+					QuarkRunIdle(0);
+				}
+				if (!bDrvOkay) {
+					if (kNetGame) QuarkRunIdle(1);
+					else Sleep(1);
+					break;
+				}
+				if (RunFrame(1, 0, 0) != 0) {
+					if (kNetGame) QuarkRunIdle(1);
+					break;
+				}
+				nFramesRendered++;
+				if (!FBA_LuaCaptureActive() || bMediaExit || (!kNetGame && nReplayStatus == 0)) {
+					break;
+				}
+			}
+		} else {
+			// Unthrottled rendered mode (used during capture_clip.lua normal-speed gdscreenshot windows)
+			if (kNetGame) {
+				QuarkRunIdle(0);
+			}
+			if (!bDrvOkay) {
+				if (kNetGame) QuarkRunIdle(1);
+				else Sleep(1);
+			} else if (RunFrame(1, 0, 0) != 0) {
+				if (kNetGame) QuarkRunIdle(1);
+			} else {
+				nFramesRendered++;
+				if (bHeadlessMode) {
+					if (kNetLua && pVidImage && nVidImageWidth > 0 && nVidImageHeight > 0) {
+						FBA_LuaGui(pVidImage + nVidImageLeft * nVidImageBPP, nVidImageWidth, nVidImageHeight, nVidImageBPP, nVidImagePitch);
+					}
+				} else {
+					VidPaint(3);
+				}
+			}
+		}
+		nFrameLast = timeGetTime();
+		return 0;
+	}
+
 	if (bAudPlaying) {
 		AudSoundCheck();
 	}
@@ -363,7 +460,9 @@ int RunIdle()
 	// Render loop with sound
 	double nTime = timeGetTime();
 	double nAccTime = nTime - nFrameLast;
-	double nFps = 1000.0 * 100.0 / nAppVirtualFps;
+	double effectiveScale = (kNetGame && !kNetSpectator) ? 1.0 : fAppSpeedScale;
+	if (effectiveScale < 0.10) effectiveScale = 0.10;
+	double nFps = 1000.0 * 100.0 / (nAppVirtualFps * effectiveScale);
 	double nFpsIdle = nFps - 1.0;
 
 	if (nAccTime < nFps || (kNetGame && nRunQuark)) {
@@ -466,7 +565,10 @@ int RunReset()
 
 int RunInit()
 {
-	AudSoundPlay();
+	if (!bMaxSpeedMode) {
+		AudSoundPlay();
+		AudSoundSetSpeed(EmulatorGetSpeedScale());
+	}
 
 	RunReset();
 
@@ -482,6 +584,9 @@ int RunExit()
 
 	bAppDoFast = 0;
 	bAppDoFastToggled = 0;
+	if (!bRestartVideo) {
+		fAppSpeedScale = 1.0;
+	}
 
 	return 0;
 }
@@ -519,12 +624,14 @@ int RunMessageLoop()
 
 		RunInit();
 
-		ShowWindow(hScrnWnd, nAppShowCmd);								// Show the screen window
-		nAppShowCmd = SW_NORMAL;
-		SetForegroundWindow(hScrnWnd);
+		if (!bHeadlessMode) {
+			ShowWindow(hScrnWnd, nAppShowCmd);								// Show the screen window
+			nAppShowCmd = SW_NORMAL;
+			SetForegroundWindow(hScrnWnd);
 
-		GameInpCheckLeftAlt();
-		GameInpCheckMouse();															// Hide the cursor
+			GameInpCheckLeftAlt();
+			GameInpCheckMouse();															// Hide the cursor
+		}
 
 		if (bVidDWMSync) {
 			bprintf(0, _T("[Win7+] Sync to DWM is enabled (if available).\n"));
@@ -939,6 +1046,10 @@ int RunMessageLoop()
 				// No messages are waiting
 				SplashDestroy(0);
 				RunIdle();
+				if (bMediaExit) {
+					MediaExit(true);
+					break;
+				}
 			}
 		}
 

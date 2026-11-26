@@ -21,6 +21,8 @@ static UINT32 nAudActive = 0;
 	extern struct AudOut AudOutDx;
 	extern struct AudOut AudOutXAudio2;
 	extern struct AudOut AudOutWasapi;
+	extern void DxSoundSetSpeed(double fScale);
+	extern void XAudio2SetSpeed(double fScale);
 #elif defined (BUILD_MACOS)
     extern struct AudOut AudOutMacOS;
 #elif defined (BUILD_SDL) 
@@ -160,6 +162,20 @@ INT32 AudSoundSetVolume()
 		return 1;
 	}
 	return pAudOut[nAudActive]->SoundSetVolume();
+}
+
+void AudSoundSetSpeed(double fScale)
+{
+	if (!bAudOkay || nAudActive >= AUD_LEN) {
+		return;
+	}
+#if defined (BUILD_WIN32)
+	if (pAudOut[nAudActive] == &AudOutDx) {
+		DxSoundSetSpeed(fScale);
+	} else if (pAudOut[nAudActive] == &AudOutXAudio2) {
+		XAudio2SetSpeed(fScale);
+	}
+#endif
 }
 
 InterfaceInfo* AudGetInfo()

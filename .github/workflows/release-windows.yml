@@ -1,0 +1,118 @@
+name: Build & Release fcadefbneo_fast (Windows x86)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fast-ingest
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - fast-ingest
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout fightcade-fbneo-fast
+        uses: actions/checkout@v4
+
+      - name: Locate MSBuild & Visual Studio Developer Environment
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install DirectX SDK (D3DX9 headers/libs via NuGet)
+        shell: pwsh
+        run: |
+          $dxsdkDir = "${{ runner.temp }}\dxsdk"
+          New-Item -ItemType Directory -Path $dxsdkDir -Force | Out-Null
+          nuget install Microsoft.DXSDK.D3DX -Version 9.29.952.8 -OutputDirectory $dxsdkDir -ExcludeVersion
+          $pkgRoot = Join-Path $dxsdkDir "Microsoft.DXSDK.D3DX\build\native"
+          "DXSDK_INCLUDE=$pkgRoot\include" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DXSDK_LIB=$pkgRoot\debug\lib\x86" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if (Test-Path "$pkgRoot\release\lib\x86") {
+            "DXSDK_LIB=$pkgRoot\release\lib\x86" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Build Release|Win32 with Static CRT (/MT)
+        shell: pwsh
+        run: |
+          $proj = "projectfiles\visualstudio-2015\fbneo_vs2015.vcxproj"
+          $inc = "$env:DXSDK_INCLUDE;..\..\src\dep\vc\include"
+          $lib = "$env:DXSDK_LIB;..\..\src\dep\ggpo\lib"
+          msbuild $proj `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=Win32 `
+            /p:PlatformToolset=v143 `
+            /p:AdditionalIncludeDirectories="$inc" `
+            /p:AdditionalLibraryDirectories="$lib" `
+            /m `
+            /v:minimal
+
+      - name: Stage Release Bundle & Verify Zero VCRUNTIME140 Dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $builtExe = "build\fcadefbneo.exe"
+          if (-not (Test-Path -LiteralPath $builtExe)) {
+            throw "Expected built binary not found at $builtExe"
+          }
+          if (-not (Test-Path -LiteralPath "src\license.txt")) {
+            throw "Verbatim FBNeo src\license.txt is required for redistribution"
+          }
+
+          # Verify static CRT (/MT): must NOT depend on VCRUNTIME140.dll or MSVCP140.dll
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -property installationPath
+          $dumpbin = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter "dumpbin.exe" |
+            Where-Object { $_.FullName -match "Hostx64\\x86" } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ($dumpbin) {
+            $deps = & $dumpbin /dependents $builtExe | Out-String
+            Write-Host $deps
+            if ($deps -match "VCRUNTIME140|MSVCP140|UCRTBASE") {
+              throw "Static CRT check failed: binary still depends on dynamic VC++ runtime DLLs!"
+            }
+          }
+
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          Copy-Item -LiteralPath $builtExe -Destination "dist\fcadefbneo_fast.exe" -Force
+          Copy-Item -LiteralPath "src\license.txt" -Destination "dist\license.txt" -Force
+
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\fcadefbneo_fast.exe").Hash.ToLower()
+          $licHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\license.txt").Hash.ToLower()
+          @(
+            "$exeHash  fcadefbneo_fast.exe"
+            "$licHash  license.txt"
+          ) | Set-Content -Path "dist\SHA256SUMS.txt" -Encoding ascii
+          Get-Content "dist\SHA256SUMS.txt"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fcadefbneo_fast-win32
+          path: |
+            dist/fcadefbneo_fast.exe
+            dist/license.txt
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release (Tags Only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            Automated Windows x86 Release build of `fcadefbneo_fast.exe` (static CRT `/MT`, `-headless`, `-maxspeed`, `emu.setspeed`, direct `pVidImage` capture pipe, and quoted-path CLI fix).
+
+            - Built strictly from public source via GitHub Actions.
+            - Includes verbatim FBNeo `license.txt` (non-commercial license).
+            - Contains **zero ROM images** and **zero donation links**.
+            - Verify integrity against `SHA256SUMS.txt` before use.
+          files: |
+            dist/fcadefbneo_fast.exe
+            dist/license.txt
+            dist/SHA256SUMS.txt

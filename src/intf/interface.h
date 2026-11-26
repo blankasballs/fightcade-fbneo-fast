@@ -128,6 +128,7 @@ INT32 AudSoundFrame();
 INT32 AudSoundPlay();
 INT32 AudSoundStop();
 INT32 AudSoundSetVolume();
+void AudSoundSetSpeed(double fScale);
 INT32 AudSoundGetSampleRate();
 INT32 AudSoundGetSegLen();
 InterfaceInfo* AudGetInfo();

@@ -41,7 +41,11 @@ int ConfigAppLoad()
 	CreateConfigName(szConfig);
 
 	if ((h = _tfopen(szConfig, _T("rt"))) == NULL) {
-		return 1;
+		// Fall back to stock Fightcade fcadefbneo.ini so renamed binaries (e.g. fcadefbneo_fast.exe)
+		// inherit the user's ROM search paths and video/audio/SOCD settings automatically.
+		if ((h = _tfopen(_T("config/fcadefbneo.ini"), _T("rt"))) == NULL) {
+			return 1;
+		}
 	}
 
 	// Go through each line of the config file

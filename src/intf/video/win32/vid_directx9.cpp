@@ -2090,17 +2090,19 @@ static int dx9AltFrame(bool bRedraw)	// bRedraw = 0
 		return 1;
 	}
 
-	HRESULT nCoopLevel = pD3DDevice->TestCooperativeLevel();
-	if (nCoopLevel != D3D_OK) {		// We've lost control of the screen
-		if (nCoopLevel != D3DERR_DEVICENOTRESET) {
-			return 1;
-		}
+	if (!bHeadlessMode) {
+		HRESULT nCoopLevel = pD3DDevice->TestCooperativeLevel();
+		if (nCoopLevel != D3D_OK) {		// We've lost control of the screen
+			if (nCoopLevel != D3DERR_DEVICENOTRESET) {
+				return 1;
+			}
 
-		if (dx9AltReset()) {
-			return 1;
-		}
+			if (dx9AltReset()) {
+				return 1;
+			}
 
-		return 1;            // Skip this frame, pBurnDraw pointer not valid (dx9AltReset() -> dx9AltTextureInit() -> VidSAllocVidImage())
+			return 1;            // Skip this frame, pBurnDraw pointer not valid (dx9AltReset() -> dx9AltTextureInit() -> VidSAllocVidImage())
+		}
 	}
 
 	if (bDrvOkay) {

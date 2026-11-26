@@ -55,6 +55,9 @@ void FBA_LuaGui(unsigned char *s, int width, int height, int bpp, int pitch);
 void FBA_LuaClearGui();
 void FBA_LuaEnableGui(UINT8 enabled);
 
+int FBA_LuaCaptureActive();
+void FBA_LuaCaptureClose();
+
 char* FBA_GetLuaScriptName();
 struct lua_State* FBA_GetLuaState();
 
