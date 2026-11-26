@@ -1588,8 +1588,8 @@ del build_details.exe
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <IntDir>$(SolutionDir)$(Configuration)\</IntDir>
-    <IncludePath>C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Include;..\..\src\dep\vc\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(LibraryPath)</LibraryPath>
+    <IncludePath>$(DXSDK_INCLUDE);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Include;..\..\src\dep\vc\include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(DXSDK_LIB);$(LibraryPath)</LibraryPath>
     <TargetName>fcadefbneo</TargetName>
     <GenerateManifest>true</GenerateManifest>
   </PropertyGroup>

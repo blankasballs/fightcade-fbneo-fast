@@ -22,8 +22,10 @@ jobs:
       - name: Checkout fightcade-fbneo-fast
         uses: actions/checkout@v4
 
-      - name: Locate MSBuild & Visual Studio Developer Environment
-        uses: microsoft/setup-msbuild@v2
+      - name: Set up Visual Studio x86 Developer Environment (cl.exe + MSBuild)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
 
       - name: Install DirectX SDK (D3DX9 headers/libs via NuGet)
         shell: pwsh
@@ -33,24 +35,39 @@ jobs:
           nuget install Microsoft.DXSDK.D3DX -Version 9.29.952.8 -OutputDirectory $dxsdkDir -ExcludeVersion
           $pkgRoot = Join-Path $dxsdkDir "Microsoft.DXSDK.D3DX\build\native"
           "DXSDK_INCLUDE=$pkgRoot\include" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "DXSDK_LIB=$pkgRoot\debug\lib\x86" | Out-File -FilePath $env:GITHUB_ENV -Append
-          if (Test-Path "$pkgRoot\release\lib\x86") {
-            "DXSDK_LIB=$pkgRoot\release\lib\x86" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $libDir = "$pkgRoot\release\lib\x86"
+          if (-not (Test-Path $libDir)) {
+            $libDir = "$pkgRoot\debug\lib\x86"
           }
+          "DXSDK_LIB=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "DXSDK_INCLUDE=$pkgRoot\include"
+          Write-Host "DXSDK_LIB=$libDir"
 
-      - name: Build Release|Win32 with Static CRT (/MT)
+      - name: Generate FBNeo Driver Lists & Headers (Perl)
         shell: pwsh
         run: |
-          $proj = "projectfiles\visualstudio-2015\fbneo_vs2015.vcxproj"
-          $inc = "$env:DXSDK_INCLUDE;..\..\src\dep\vc\include"
-          $lib = "$env:DXSDK_LIB;..\..\src\dep\ggpo\lib"
-          msbuild $proj `
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command perl -ErrorAction SilentlyContinue)) {
+            $env:PATH = "C:\Strawberry\perl\bin;C:\Program Files\Git\usr\bin;$env:PATH"
+          }
+          New-Item -ItemType Directory -Path "build" -Force | Out-Null
+          Push-Location "projectfiles\visualstudio-2015"
+          try {
+            cmd /c run_scripts.bat
+            if ($LASTEXITCODE -ne 0) { throw "run_scripts.bat failed with exit code $LASTEXITCODE" }
+            Get-ChildItem "generated" | Format-Table Name, Length
+          } finally {
+            Pop-Location
+          }
+
+      - name: Build Release|x86 (Win32) with Static CRT (/MT)
+        shell: pwsh
+        run: |
+          msbuild "projectfiles\visualstudio-2015\fbneo_vs2015.sln" `
             /t:Build `
             /p:Configuration=Release `
-            /p:Platform=Win32 `
+            /p:Platform=x86 `
             /p:PlatformToolset=v143 `
-            /p:AdditionalIncludeDirectories="$inc" `
-            /p:AdditionalLibraryDirectories="$lib" `
             /m `
             /v:minimal
 
