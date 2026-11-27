@@ -24,6 +24,10 @@ int MediaInit()
 	if (bAudOkay) {
 		nBurnSoundRate = AudSoundGetSampleRate();
 		nBurnSoundLen = AudSoundGetSegLen();
+	} else if (bMaxSpeedMode || bHeadlessMode) {
+		int effFps = (nAppVirtualFps > 0) ? nAppVirtualFps : ((nBurnFPS > 0) ? nBurnFPS : 6000);
+		nBurnSoundRate = 44100;
+		nBurnSoundLen = (nBurnSoundRate * 100 + (effFps >> 1)) / effFps;
 	}
 
 	if (!bVidOkay) {

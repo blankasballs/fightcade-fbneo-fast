@@ -345,8 +345,13 @@ int RunFrame(int bDraw, int bPause, int bInput)
 				// Restore state
 				RunaheadLoadState();
 			} else {
-				// Render video and audio
-				pBurnSoundOut = bMaxSpeedMode ? NULL : nAudNextSound;
+				// Render video and audio (in -maxspeed, synthesize into silent RAM capture buffer only when audio capture is open)
+				const bool bCapAudio = (FBA_LuaCaptureAudioActive() != 0);
+				if (bCapAudio) {
+					pBurnSoundOut = FBA_LuaEnsureAudioBuffer();
+				} else {
+					pBurnSoundOut = bMaxSpeedMode ? NULL : nAudNextSound;
+				}
 				VidFrame();
 				bVidImageFresh = true;
 			}
@@ -356,7 +361,12 @@ int RunFrame(int bDraw, int bPause, int bInput)
 			}
 		} else {
 			pBurnDraw = NULL;
-			pBurnSoundOut = bMaxSpeedMode ? NULL : nAudNextSound;
+			const bool bCapAudio = (FBA_LuaCaptureAudioActive() != 0);
+			if (bCapAudio) {
+				pBurnSoundOut = FBA_LuaEnsureAudioBuffer();
+			} else {
+				pBurnSoundOut = bMaxSpeedMode ? NULL : nAudNextSound;
+			}
 			BurnDrvFrame();
 			bVidImageFresh = false;
 		}

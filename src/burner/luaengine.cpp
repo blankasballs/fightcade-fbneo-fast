@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <algorithm>
+#include <deque>
 #include <vector>
 #include <assert.h>
 #include <map>
@@ -309,16 +310,127 @@ static int fba_getspeed(lua_State *L) {
 }
 
 // ============================================================================
-// Direct C++ XBuf RGB24 Headless Frame Capture (file or invisible ffmpeg pipe)
+// Direct C++ XBuf RGB24 + Silent RAM PCM Headless Frame Capture
 // ============================================================================
 static FILE* g_cap_file = NULL;
 static UINT8* g_cap_rgb_buf = NULL;
 static size_t g_cap_rgb_cap = 0;
 static int g_cap_w = 0;
 static int g_cap_h = 0;
+static FILE* g_cap_aud_file = NULL;
+static INT16* g_cap_aud_buf = NULL;
+static size_t g_cap_aud_cap_bytes = 0;
+static int g_cap_aud_samples = 0;
+static int g_cap_aud_rate = 0;
 #ifdef WIN32
+struct AudioPipeSession {
+	HANDLE hPipe;
+	HANDLE hThread;
+	HANDLE hWakeEvt;
+	CRITICAL_SECTION cs;
+	std::string pipeName;
+	std::deque<std::vector<UINT8> > queue;
+	bool eof;
+	bool broken;
+};
+
+struct PendingCaptureJob {
+	HANDLE hProc;
+	AudioPipeSession* aud;
+};
+
 static HANDLE g_cap_pipe = INVALID_HANDLE_VALUE;
 static HANDLE g_cap_proc = NULL;
+static AudioPipeSession* g_cap_aud_session = NULL;
+static std::vector<PendingCaptureJob> g_cap_pending_procs;
+
+static DWORD WINAPI AudioPipeWriterThread(LPVOID param) {
+	AudioPipeSession* s = (AudioPipeSession*)param;
+	if (!s || s->hPipe == INVALID_HANDLE_VALUE) return 0;
+
+	BOOL okConn = ConnectNamedPipe(s->hPipe, NULL);
+	if (!okConn && GetLastError() != ERROR_PIPE_CONNECTED) {
+		CloseHandle(s->hPipe);
+		s->hPipe = INVALID_HANDLE_VALUE;
+		return 0;
+	}
+
+	bool writeErr = false;
+	while (true) {
+		std::vector<UINT8> chunk;
+		bool gotChunk = false;
+		bool isEof = false;
+
+		EnterCriticalSection(&s->cs);
+		if (!s->queue.empty()) {
+			chunk.swap(s->queue.front());
+			s->queue.pop_front();
+			gotChunk = true;
+		} else {
+			isEof = s->eof;
+		}
+		LeaveCriticalSection(&s->cs);
+
+		if (gotChunk) {
+			if (!writeErr && !chunk.empty()) {
+				size_t off = 0;
+				while (off < chunk.size()) {
+					DWORD written = 0;
+					if (!WriteFile(s->hPipe, &chunk[off], (DWORD)(chunk.size() - off), &written, NULL) || written == 0) {
+						writeErr = true;
+						s->broken = true;
+						break;
+					}
+					off += (size_t)written;
+				}
+			}
+		} else if (isEof) {
+			break;
+		} else {
+			WaitForSingleObject(s->hWakeEvt, 25);
+		}
+	}
+
+	FlushFileBuffers(s->hPipe);
+	DisconnectNamedPipe(s->hPipe);
+	CloseHandle(s->hPipe);
+	s->hPipe = INVALID_HANDLE_VALUE;
+	return 0;
+}
+
+static void DestroyAudioPipeSession(AudioPipeSession* s, DWORD waitMs) {
+	if (!s) return;
+	EnterCriticalSection(&s->cs);
+	s->eof = true;
+	LeaveCriticalSection(&s->cs);
+	if (s->hWakeEvt != NULL) {
+		SetEvent(s->hWakeEvt);
+	}
+
+	if (s->hThread != NULL) {
+		DWORD res = WaitForSingleObject(s->hThread, waitMs);
+		if (res != WAIT_OBJECT_0 && !s->pipeName.empty()) {
+			// Unblock ConnectNamedPipe if child exited before connecting
+			HANDLE hDummy = CreateFileA(s->pipeName.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+			if (hDummy != INVALID_HANDLE_VALUE) {
+				CloseHandle(hDummy);
+			}
+			WaitForSingleObject(s->hThread, 3000);
+		}
+		CloseHandle(s->hThread);
+		s->hThread = NULL;
+	}
+	if (s->hPipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(s->hPipe);
+		s->hPipe = INVALID_HANDLE_VALUE;
+	}
+	if (s->hWakeEvt != NULL) {
+		CloseHandle(s->hWakeEvt);
+		s->hWakeEvt = NULL;
+	}
+	DeleteCriticalSection(&s->cs);
+	delete s;
+}
 #endif
 
 int FBA_LuaCaptureActive() {
@@ -328,7 +440,72 @@ int FBA_LuaCaptureActive() {
 	return (g_cap_file != NULL) ? 1 : 0;
 }
 
-void FBA_LuaCaptureClose() {
+int FBA_LuaCaptureAudioActive() {
+#ifdef WIN32
+	if (g_cap_aud_session != NULL) return 1;
+#endif
+	return (g_cap_aud_file != NULL) ? 1 : 0;
+}
+
+INT16* FBA_LuaEnsureAudioBuffer() {
+	if (nBurnSoundRate <= 0) {
+		nBurnSoundRate = 44100;
+	}
+	if (nBurnSoundLen <= 0) {
+		int effFps = (nBurnFPS > 0) ? nBurnFPS : 6000;
+		nBurnSoundLen = (nBurnSoundRate * 100 + (effFps >> 1)) / effFps;
+	}
+	size_t needBytes = (size_t)nBurnSoundLen * 2 * sizeof(INT16);
+	if (needBytes == 0) return NULL;
+	if (g_cap_aud_cap_bytes < needBytes || g_cap_aud_buf == NULL) {
+		INT16* p = (INT16*)realloc(g_cap_aud_buf, needBytes);
+		if (!p) return NULL;
+		memset(p, 0, needBytes);
+		g_cap_aud_buf = p;
+		g_cap_aud_cap_bytes = needBytes;
+	}
+	g_cap_aud_samples = nBurnSoundLen;
+	g_cap_aud_rate = nBurnSoundRate;
+	return g_cap_aud_buf;
+}
+
+static void FBA_LuaCaptureAudioCloseInternal() {
+	if (g_cap_aud_file) {
+		fflush(g_cap_aud_file);
+		fclose(g_cap_aud_file);
+		g_cap_aud_file = NULL;
+	}
+}
+
+#ifdef WIN32
+static void FBA_LuaReapPendingCaptureProcs(bool waitAll) {
+	if (g_cap_pending_procs.empty()) return;
+	std::vector<PendingCaptureJob> remaining;
+	for (size_t i = 0; i < g_cap_pending_procs.size(); i++) {
+		PendingCaptureJob job = g_cap_pending_procs[i];
+		if (!job.hProc && !job.aud) continue;
+		bool procDone = true;
+		if (job.hProc) {
+			DWORD res = WaitForSingleObject(job.hProc, waitAll ? 30000 : 0);
+			procDone = (waitAll || res == WAIT_OBJECT_0);
+		}
+		if (procDone) {
+			if (job.aud) {
+				DestroyAudioPipeSession(job.aud, 4000);
+			}
+			if (job.hProc) {
+				CloseHandle(job.hProc);
+			}
+		} else {
+			remaining.push_back(job);
+		}
+	}
+	g_cap_pending_procs.swap(remaining);
+}
+#endif
+
+static void FBA_LuaCaptureCloseInternal(bool waitProc) {
+	FBA_LuaCaptureAudioCloseInternal();
 	if (g_cap_file) {
 		fflush(g_cap_file);
 		fclose(g_cap_file);
@@ -339,14 +516,47 @@ void FBA_LuaCaptureClose() {
 		CloseHandle(g_cap_pipe);
 		g_cap_pipe = INVALID_HANDLE_VALUE;
 	}
+	AudioPipeSession* audSess = g_cap_aud_session;
+	g_cap_aud_session = NULL;
+	if (audSess != NULL) {
+		EnterCriticalSection(&audSess->cs);
+		audSess->eof = true;
+		LeaveCriticalSection(&audSess->cs);
+		if (audSess->hWakeEvt != NULL) {
+			SetEvent(audSess->hWakeEvt);
+		}
+	}
 	if (g_cap_proc != NULL) {
-		WaitForSingleObject(g_cap_proc, 20000);
-		CloseHandle(g_cap_proc);
+		if (waitProc) {
+			if (audSess != NULL) {
+				DestroyAudioPipeSession(audSess, 5000);
+				audSess = NULL;
+			}
+			WaitForSingleObject(g_cap_proc, 30000);
+			CloseHandle(g_cap_proc);
+		} else {
+			PendingCaptureJob job;
+			job.hProc = g_cap_proc;
+			job.aud = audSess;
+			audSess = NULL;
+			g_cap_pending_procs.push_back(job);
+		}
 		g_cap_proc = NULL;
 	}
+	if (audSess != NULL) {
+		DestroyAudioPipeSession(audSess, 2000);
+	}
+	FBA_LuaReapPendingCaptureProcs(false);
 #endif
 	g_cap_w = 0;
 	g_cap_h = 0;
+}
+
+void FBA_LuaCaptureClose() {
+	FBA_LuaCaptureCloseInternal(true);
+#ifdef WIN32
+	FBA_LuaReapPendingCaptureProcs(true);
+#endif
 }
 
 static bool EnsureCaptureBuffer(int w, int h) {
@@ -364,7 +574,7 @@ static bool EnsureCaptureBuffer(int w, int h) {
 // boolean, w, h = emu.capture_open(path)
 static int fba_capture_open(lua_State *L) {
 	const char* path = luaL_checkstring(L, 1);
-	FBA_LuaCaptureClose();
+	FBA_LuaCaptureCloseInternal(true);
 
 	if (nVidImageWidth <= 0 || nVidImageHeight <= 0) {
 		lua_pushnil(L);
@@ -391,7 +601,7 @@ static int fba_capture_open(lua_State *L) {
 // boolean, w, h = emu.capture_pipe(cmdline)
 static int fba_capture_pipe(lua_State *L) {
 	const char* cmdline = luaL_checkstring(L, 1);
-	FBA_LuaCaptureClose();
+	FBA_LuaCaptureCloseInternal(false);
 
 	if (nVidImageWidth <= 0 || nVidImageHeight <= 0) {
 		lua_pushnil(L);
@@ -556,12 +766,247 @@ static int fba_capture_frame(lua_State *L) {
 		wroteOk = (fwrite(g_cap_rgb_buf, 1, totalBytes, g_cap_file) == totalBytes);
 	}
 
+	if (wroteOk) {
+#ifdef WIN32
+		if (g_cap_aud_session != NULL && !g_cap_aud_session->broken) {
+			INT16* abuf = FBA_LuaEnsureAudioBuffer();
+			if (abuf && g_cap_aud_samples > 0) {
+				size_t audBytes = (size_t)g_cap_aud_samples * 2 * sizeof(INT16);
+				const UINT8* raw = (const UINT8*)abuf;
+				std::vector<UINT8> chunk(raw, raw + audBytes);
+				EnterCriticalSection(&g_cap_aud_session->cs);
+				g_cap_aud_session->queue.push_back(std::move(chunk));
+				LeaveCriticalSection(&g_cap_aud_session->cs);
+				if (g_cap_aud_session->hWakeEvt != NULL) {
+					SetEvent(g_cap_aud_session->hWakeEvt);
+				}
+			}
+		} else
+#endif
+		if (g_cap_aud_file != NULL) {
+			INT16* abuf = FBA_LuaEnsureAudioBuffer();
+			if (abuf && g_cap_aud_samples > 0) {
+				size_t audBytes = (size_t)g_cap_aud_samples * 2 * sizeof(INT16);
+				fwrite(abuf, 1, audBytes, g_cap_aud_file);
+			}
+		}
+	}
+
 	lua_pushboolean(L, wroteOk ? 1 : 0);
 	return 1;
 }
 
-// boolean = emu.capture_close()
+// rate, samples_per_frame = emu.capture_audio_info()
+static int fba_capture_audio_info(lua_State *L) {
+	INT16* abuf = FBA_LuaEnsureAudioBuffer();
+	if (!abuf || g_cap_aud_samples <= 0) {
+		lua_pushinteger(L, 44100);
+		lua_pushinteger(L, 740);
+		return 2;
+	}
+	lua_pushinteger(L, g_cap_aud_rate);
+	lua_pushinteger(L, g_cap_aud_samples);
+	return 2;
+}
+
+// boolean, w, h, rate, spf = emu.capture_pipe_av(cmdline, audio_pipe_name)
+static int fba_capture_pipe_av(lua_State *L) {
+	const char* cmdline = luaL_checkstring(L, 1);
+	const char* pipeName = luaL_checkstring(L, 2);
+	FBA_LuaCaptureCloseInternal(false);
+
+	if (nVidImageWidth <= 0 || nVidImageHeight <= 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Video buffer not initialized");
+		return 2;
+	}
+	INT16* abuf = FBA_LuaEnsureAudioBuffer();
+	if (!abuf || g_cap_aud_samples <= 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Audio capture buffer unavailable");
+		return 2;
+	}
+	memset(abuf, 0, (size_t)g_cap_aud_samples * 2 * sizeof(INT16));
+#ifdef WIN32
+	HANDLE hAudPipe = CreateNamedPipeA(
+		pipeName,
+		PIPE_ACCESS_OUTBOUND,
+		PIPE_TYPE_BYTE | PIPE_WAIT,
+		1,
+		1024 * 1024,
+		0,
+		0,
+		NULL
+	);
+	if (hAudPipe == INVALID_HANDLE_VALUE) {
+		lua_pushnil(L);
+		lua_pushstring(L, "CreateNamedPipeA failed for audio pipe");
+		return 2;
+	}
+
+	AudioPipeSession* aud = new AudioPipeSession();
+	aud->hPipe = hAudPipe;
+	aud->hThread = NULL;
+	aud->hWakeEvt = CreateEventA(NULL, FALSE, FALSE, NULL);
+	aud->pipeName = pipeName;
+	aud->eof = false;
+	aud->broken = false;
+	InitializeCriticalSection(&aud->cs);
+	aud->hThread = CreateThread(NULL, 0, AudioPipeWriterThread, aud, 0, NULL);
+	if (aud->hThread == NULL) {
+		DestroyAudioPipeSession(aud, 0);
+		lua_pushnil(L);
+		lua_pushstring(L, "CreateThread failed for audio pipe writer");
+		return 2;
+	}
+
+	SECURITY_ATTRIBUTES sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.nLength = sizeof(sa);
+	sa.bInheritHandle = TRUE;
+
+	HANDLE hRead = INVALID_HANDLE_VALUE;
+	HANDLE hWrite = INVALID_HANDLE_VALUE;
+	if (!CreatePipe(&hRead, &hWrite, &sa, 1024 * 1024)) {
+		DestroyAudioPipeSession(aud, 100);
+		lua_pushnil(L);
+		lua_pushstring(L, "CreatePipe failed");
+		return 2;
+	}
+	SetHandleInformation(hWrite, HANDLE_FLAG_INHERIT, 0);
+
+	HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+
+	STARTUPINFOA si;
+	memset(&si, 0, sizeof(si));
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+	si.hStdInput = hRead;
+	si.hStdOutput = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_OUTPUT_HANDLE);
+	si.hStdError = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE);
+
+	PROCESS_INFORMATION pi;
+	memset(&pi, 0, sizeof(pi));
+
+	std::string cmdCopy(cmdline);
+	BOOL ok = CreateProcessA(
+		NULL,
+		&cmdCopy[0],
+		NULL,
+		NULL,
+		TRUE,
+		CREATE_NO_WINDOW,
+		NULL,
+		NULL,
+		&si,
+		&pi
+	);
+
+	CloseHandle(hRead);
+	if (hNul != INVALID_HANDLE_VALUE) {
+		CloseHandle(hNul);
+	}
+
+	if (!ok) {
+		CloseHandle(hWrite);
+		DestroyAudioPipeSession(aud, 100);
+		lua_pushnil(L);
+		lua_pushstring(L, "CreateProcessA failed for capture_pipe_av");
+		return 2;
+	}
+
+	CloseHandle(pi.hThread);
+	g_cap_pipe = hWrite;
+	g_cap_proc = pi.hProcess;
+	g_cap_aud_session = aud;
+	g_cap_w = nVidImageWidth;
+	g_cap_h = nVidImageHeight;
+	EnsureCaptureBuffer(g_cap_w, g_cap_h);
+
+	lua_pushboolean(L, 1);
+	lua_pushinteger(L, g_cap_w);
+	lua_pushinteger(L, g_cap_h);
+	lua_pushinteger(L, g_cap_aud_rate);
+	lua_pushinteger(L, g_cap_aud_samples);
+	return 5;
+#else
+	lua_pushnil(L);
+	lua_pushstring(L, "capture_pipe_av only supported on Win32");
+	return 2;
+#endif
+}
+
+// boolean, rate, samples_per_frame = emu.capture_audio_open(pcm_path)
+static int fba_capture_audio_open(lua_State *L) {
+	const char* path = luaL_checkstring(L, 1);
+	FBA_LuaCaptureAudioCloseInternal();
+
+	INT16* abuf = FBA_LuaEnsureAudioBuffer();
+	if (!abuf || g_cap_aud_samples <= 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Audio capture buffer unavailable");
+		return 2;
+	}
+	memset(abuf, 0, (size_t)g_cap_aud_samples * 2 * sizeof(INT16));
+	FILE* f = fopen(path, "wb");
+	if (!f) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Failed to open audio PCM output path");
+		return 2;
+	}
+	setvbuf(f, NULL, _IOFBF, 256 * 1024);
+	g_cap_aud_file = f;
+
+	lua_pushboolean(L, 1);
+	lua_pushinteger(L, g_cap_aud_rate);
+	lua_pushinteger(L, g_cap_aud_samples);
+	return 3;
+}
+
+// boolean = emu.capture_audio_frame()
+static int fba_capture_audio_frame(lua_State *L) {
+	if (!g_cap_aud_file) {
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	INT16* abuf = FBA_LuaEnsureAudioBuffer();
+	if (!abuf || g_cap_aud_samples <= 0) {
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+	size_t audBytes = (size_t)g_cap_aud_samples * 2 * sizeof(INT16);
+	bool ok = (fwrite(abuf, 1, audBytes, g_cap_aud_file) == audBytes);
+	lua_pushboolean(L, ok ? 1 : 0);
+	return 1;
+}
+
+// boolean = emu.capture_audio_close()
+static int fba_capture_audio_close(lua_State *L) {
+	FBA_LuaCaptureAudioCloseInternal();
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// boolean = emu.capture_audio_active()
+static int fba_capture_audio_active(lua_State *L) {
+	lua_pushboolean(L, FBA_LuaCaptureAudioActive() ? 1 : 0);
+	return 1;
+}
+
+// boolean = emu.capture_close([wait])
 static int fba_capture_close(lua_State *L) {
+	bool waitProc = true;
+	if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
+		waitProc = (lua_toboolean(L, 1) != 0);
+	}
+	FBA_LuaCaptureCloseInternal(waitProc);
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+// boolean = emu.capture_wait_all()
+static int fba_capture_wait_all(lua_State *L) {
 	FBA_LuaCaptureClose();
 	lua_pushboolean(L, 1);
 	return 1;
@@ -4122,9 +4567,16 @@ static const struct luaL_reg fbalib [] = {
 	{"getspeed", fba_getspeed},
 	{"capture_open", fba_capture_open},
 	{"capture_pipe", fba_capture_pipe},
+	{"capture_pipe_av", fba_capture_pipe_av},
 	{"capture_frame", fba_capture_frame},
 	{"capture_close", fba_capture_close},
+	{"capture_wait_all", fba_capture_wait_all},
 	{"capture_active", fba_capture_active},
+	{"capture_audio_info", fba_capture_audio_info},
+	{"capture_audio_open", fba_capture_audio_open},
+	{"capture_audio_frame", fba_capture_audio_frame},
+	{"capture_audio_close", fba_capture_audio_close},
+	{"capture_audio_active", fba_capture_audio_active},
 	{"frameadvance", fba_frameadvance},
 	{"isonline", fba_isonline},
 	{"isreplay", fba_isreplay},

@@ -57,6 +57,8 @@ void FBA_LuaEnableGui(UINT8 enabled);
 
 int FBA_LuaCaptureActive();
 void FBA_LuaCaptureClose();
+int FBA_LuaCaptureAudioActive();
+INT16* FBA_LuaEnsureAudioBuffer();
 
 char* FBA_GetLuaScriptName();
 struct lua_State* FBA_GetLuaState();
